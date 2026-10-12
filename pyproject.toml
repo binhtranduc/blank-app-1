@@ -1,12 +1,421 @@
-[project]
-name = "blank-app-template"
-version = "0.1.0"
-description = "A simple Streamlit app template."
-readme = "README.md"
-requires-python = ">=3.14"
-dependencies = [
-    "streamlit>=1.61.1",
-]
+"""
+Perps Momentum Bot - Single-File Edition
+BTC, ETH, SOL, AVAX, SUI | both-ways momentum | ATR stops/targets | exchange-side exits
+"""
 
-[tool.uv]
-package = false
+import asyncio
+import argparse
+import logging
+import os
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+import ccxt.async_support as ccxt
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("perps_bot")
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+SYMBOLS = {
+    "BTC/USDT:USDT":  dict(tier="core",     max_lev=5.0, risk_pct=0.0075, atr_mult_stop=1.8, atr_mult_target=3.0),
+    "ETH/USDT:USDT":  dict(tier="core",     max_lev=5.0, risk_pct=0.0075, atr_mult_stop=1.8, atr_mult_target=3.0),
+    "SOL/USDT:USDT":  dict(tier="highbeta", max_lev=3.0, risk_pct=0.005,  atr_mult_stop=2.0, atr_mult_target=3.5),
+    "AVAX/USDT:USDT": dict(tier="highbeta", max_lev=3.0, risk_pct=0.005,  atr_mult_stop=2.0, atr_mult_target=3.5),
+    "SUI/USDT:USDT":  dict(tier="ultra",    max_lev=2.0, risk_pct=0.0035, atr_mult_stop=2.2, atr_mult_target=4.0),
+}
+
+TAKER_FEE          = 0.0005
+MAX_CONCURRENT     = 2
+DAILY_LOSS_CAP     = 0.02
+HARD_LEV_CAP       = 5.0
+MIN_TARGET_RR      = 1.5
+BREAKOUT_LOOKBACK  = 24
+EMA_TREND_PERIOD   = 200
+ATR_PERIOD         = 14
+STARTING_EQUITY    = 10_000.0
+
+POLL_SECONDS       = 60
+FUNDING_CHECK_H    = 8
+HEARTBEAT_FILE     = "bot_heartbeat.txt"
+MAX_ORDER_RETRIES  = 3
+SLIPPAGE_GUARD     = 0.005
+
+# ============================================================
+# INDICATORS & SIGNAL
+# ============================================================
+
+def atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
+    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+def ema(s: pd.Series, period: int) -> pd.Series:
+    return s.ewm(span=period, adjust=False).mean()
+
+def signal_for_bar(df: pd.DataFrame, i: int) -> Optional[str]:
+    """Long: close breaks 24-bar high AND > EMA200. Short: breaks low AND < EMA200."""
+    if i < max(BREAKOUT_LOOKBACK, EMA_TREND_PERIOD, ATR_PERIOD) + 1:
+        return None
+    row = df.iloc[i]
+    window = df.iloc[i - BREAKOUT_LOOKBACK:i]
+    hi, lo = window["high"].max(), window["low"].min()
+    if row["close"] > hi and row["close"] > row["ema"]:
+        return "long"
+    if row["close"] < lo and row["close"] < row["ema"]:
+        return "short"
+    return None
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df["atr"] = atr(df)
+    df["ema"] = ema(df["close"], EMA_TREND_PERIOD)
+    return df
+
+# ============================================================
+# SHARED STATE
+# ============================================================
+
+@dataclass
+class Position:
+    symbol: str
+    side: str
+    entry: float
+    qty: float
+    leverage: float
+    stop: float
+    target: float
+    ts: str
+
+@dataclass
+class Portfolio:
+    equity: float = STARTING_EQUITY
+    day_start_equity: float = STARTING_EQUITY
+    current_day: Optional[str] = None
+    halted_today: bool = False
+    open_positions: dict = field(default_factory=dict)
+
+    def roll_day(self, ts: datetime):
+        d = ts.date().isoformat()
+        if self.current_day != d:
+            self.current_day = d
+            self.day_start_equity = self.equity
+            self.halted_today = False
+
+    def daily_check(self):
+        if self.day_start_equity > 0:
+            day_pnl = (self.equity - self.day_start_equity) / self.day_start_equity
+            if day_pnl <= -DAILY_LOSS_CAP:
+                if not self.halted_today:
+                    log.warning(f"DAILY CIRCUIT BREAKER ({day_pnl*100:.1f}%) - no new entries today")
+                self.halted_today = True
+
+# ============================================================
+# BACKTEST MODE
+# ============================================================
+
+async def run_backtest(days: int = 180):
+    exchange = ccxt.binance({"enableRateLimit": True})
+    since = exchange.parse8601(
+        (datetime.now(timezone.utc) - timedelta(days=days)).isoformat())
+    data = {}
+    for sym in SYMBOLS:
+        rows = []
+        while True:
+            batch = await exchange.fetch_ohlcv(sym, "1h", since=since, limit=1000)
+            if not batch:
+                break
+            rows.extend(batch)
+            since = batch[-1][0] + 1
+            if len(batch) < 1000:
+                break
+        df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+        df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        df = df.set_index("time").drop(columns="ts")
+        data[sym] = add_indicators(df)
+        log.info(f"loaded {sym}: {len(df)} bars")
+        since = exchange.parse8601(
+            (datetime.now(timezone.utc) - timedelta(days=days)).isoformat())
+    await exchange.close()
+
+    pf = Portfolio()
+    equity_curve = []
+    closed_trades = []
+
+    def open_position(sym, cfg, sig, px, ts, a):
+        stop_dist = cfg["atr_mult_stop"] * a
+        tgt_dist = cfg["atr_mult_target"] * a
+        if tgt_dist / stop_dist < MIN_TARGET_RR:
+            return
+        qty = pf.equity * cfg["risk_pct"] / stop_dist
+        notional = qty * px
+        lev = min(tgt_dist / a, cfg["max_lev"], HARD_LEV_CAP)
+        if notional > pf.equity * lev:
+            notional = pf.equity * lev
+            qty = notional / px
+        stop = px - stop_dist if sig == "long" else px + stop_dist
+        tgt = px + tgt_dist if sig == "long" else px - tgt_dist
+        pf.equity -= notional * TAKER_FEE
+        pf.open_positions[sym] = Position(sym, sig, px, qty, lev, stop, tgt, str(ts))
+
+    def check_exits(sym, candle):
+        pos = pf.open_positions.get(sym)
+        if pos is None:
+            return
+        hit_stop = candle["low"] <= pos.stop if pos.side == "long" else candle["high"] >= pos.stop
+        hit_tgt = candle["high"] >= pos.target if pos.side == "long" else candle["low"] <= pos.target
+        if hit_stop:
+            exit_px, reason = pos.stop, "STOP"
+        elif hit_tgt:
+            exit_px, reason = pos.target, "TP"
+        else:
+            return
+        d = (exit_px - pos.entry) * pos.qty
+        pnl = d if pos.side == "long" else -d
+        fees = pos.qty * (pos.entry + exit_px) * TAKER_FEE
+        pf.equity += pnl - fees
+        closed_trades.append(dict(time=str(candle.name), symbol=sym, reason=reason,
+                                  side=pos.side, pnl=pnl - fees, lev=pos.leverage))
+        del pf.open_positions[sym]
+
+    first = list(data.values())[0]
+    for ts in first.index:
+        pf.roll_day(ts)
+        pf.daily_check()
+        for sym, df in data.items():
+            if ts in df.index:
+                check_exits(sym, df.loc[ts])
+        if len(pf.open_positions) < MAX_CONCURRENT and not pf.halted_today:
+            for sym, df in data.items():
+                if sym in pf.open_positions or ts not in df.index:
+                    continue
+                j = df.index.get_loc(ts)
+                sig = signal_for_bar(df, j)
+                if sig:
+                    open_position(sym, SYMBOLS[sym], sig, df.iloc[j]["close"], ts, df.iloc[j]["atr"])
+                if len(pf.open_positions) >= MAX_CONCURRENT or pf.halted_today:
+                    break
+        mtm = pf.equity
+        for pos in pf.open_positions.values():
+            df = data[pos.symbol]
+            if ts in df.index:
+                c = df.loc[ts]["close"]
+                d = (c - pos.entry) * pos.qty
+                mtm += d if pos.side == "long" else -d
+        equity_curve.append((ts, mtm))
+
+    eq = pd.Series([e for _, e in equity_curve], index=[t for t, _ in equity_curve])
+    dd = (eq / eq.cummax() - 1).min() * 100
+    wins = [t for t in closed_trades if t["pnl"] > 0]
+    losses = [t for t in closed_trades if t["pnl"] <= 0]
+    log.info("=" * 50)
+    log.info(f"FINAL EQUITY:  ${pf.equity:,.2f}  ({(pf.equity/STARTING_EQUITY-1)*100:+.1f}%)")
+    log.info(f"closed trades: {len(closed_trades)}")
+    if closed_trades:
+        log.info(f"win rate:      {len(wins)/len(closed_trades)*100:.1f}%")
+        if wins:
+            log.info(f"avg win:       ${np.mean([t['pnl'] for t in wins]):,.2f}")
+        if losses:
+            log.info(f"avg loss:     ${np.mean([t['pnl'] for t in losses]):,.2f}")
+    log.info(f"max drawdown:  {dd:.1f}%")
+
+# ============================================================
+# LIVE EXECUTOR (exchange-side stops)
+# ============================================================
+
+class Executor:
+    def __init__(self, exchange, dry: bool):
+        self.x = exchange
+        self.dry = dry
+
+    async def set_leverage(self, symbol: str, lev: float):
+        if self.dry:
+            return
+        await self.x.set_leverage(int(lev), symbol)
+
+    async def market_entry(self, symbol, side, qty, signal_price):
+        if self.dry:
+            log.info(f"[DRY] {side.upper()} {qty:.6f} {symbol} @ ~{signal_price:.2f}")
+            return {"average": signal_price, "id": "DRY"}
+        ticker = await self.x.fetch_ticker(symbol)
+        px = ticker["last"]
+        if abs(px - signal_price) / signal_price > SLIPPAGE_GUARD:
+            log.warning(f"SKIP {symbol}: drifted {abs(px-signal_price)/signal_price*100:.2f}%")
+            return None
+        for attempt in range(MAX_ORDER_RETRIES):
+            try:
+                order = await self.x.create_order(symbol, "market", side, qty, None, {})
+                log.info(f"FILLED {side} {qty:.6f} {symbol} @ {order.get('average')}")
+                return order
+            except ccxt.NetworkError as e:
+                log.warning(f"network error {attempt+1}: {e}")
+                await asyncio.sleep(2 ** attempt)
+        log.error(f"entry FAILED after retries: {symbol}")
+        return None
+
+    async def protective_orders(self, symbol, side, qty, stop, target):
+        close_side = "sell" if side == "buy" else "buy"
+        if self.dry:
+            log.info(f"[DRY] SL {stop:.2f} / TP {target:.2f} on {symbol}")
+            return
+        try:
+            await self.x.create_order(symbol, "STOP_MARKET", close_side, qty, None,
+                                      {"stopPrice": stop, "reduceOnly": True})
+            await self.x.create_order(symbol, "TAKE_PROFIT_MARKET", close_side, qty, None,
+                                      {"stopPrice": target, "reduceOnly": True})
+        except Exception as e:
+            log.error(f"protective orders FAILED {symbol}: {e} - emergency flatten")
+            await self.emergency_flatten(symbol, close_side, qty)
+
+    async def emergency_flatten(self, symbol, close_side, qty):
+        if self.dry:
+            return
+        try:
+            await self.x.create_order(symbol, "market", close_side, qty, None,
+                                      {"reduceOnly": True})
+            log.warning(f"FLATTENED {symbol}")
+        except Exception as e:
+            log.critical(f"COULD NOT FLATTEN {symbol}: {e} - MANUAL INTERVENTION REQUIRED")
+
+# ============================================================
+# LIVE LOOP
+# ============================================================
+
+class LiveBot:
+    def __init__(self, mode: str):
+        self.dry = (mode == "dry")
+        params = dict(enableRateLimit=True, options={"defaultType": "future"})
+        if mode == "testnet":
+            self.x = ccxt.binance({**params, "apiKey": os.getenv("API_KEY", "test"),
+                                   "secret": os.getenv("API_SECRET", "test")})
+            self.x.set_sandbox_mode(True)
+        else:
+            self.x = ccxt.binance({**params,
+                                   "apiKey": os.environ.get("API_KEY", ""),
+                                   "secret": os.environ.get("API_SECRET", "")})
+        self.ex = Executor(self.x, self.dry)
+        self.pf = Portfolio()
+
+    async def get_equity(self) -> float:
+        if self.dry:
+            return self.pf.equity
+        bal = await self.x.fetch_balance()
+        return float(bal["USDT"]["total"]) if bal.get("USDT") else 0.0
+
+    async def sync_positions(self) -> dict:
+        if self.dry:
+            return {}
+        poss = await self.x.fetch_positions()
+        live = {p["symbol"]: p for p in poss if float(p.get("contracts") or 0) > 0}
+        for sym in list(self.pf.open_positions):
+            if sym not in live:
+                log.info(f"{sym} closed by exchange (SL/TP) - clearing state")
+                del self.pf.open_positions[sym]
+        return live
+
+    async def evaluate_entries(self, live_syms: dict):
+        if len(live_syms) + len(self.pf.open_positions) >= MAX_CONCURRENT:
+            return
+        if self.pf.halted_today:
+            return
+        for sym, cfg in SYMBOLS.items():
+            if sym in live_syms or sym in self.pf.open_positions:
+                continue
+            if len(live_syms) + len(self.pf.open_positions) >= MAX_CONCURRENT:
+                break
+            df = await self.fetch_recent(sym)
+            if df is None or len(df) < EMA_TREND_PERIOD + 2:
+                continue
+            j = len(df) - 1
+            last_bar = df.index[-1].to_pydatetime().replace(tzinfo=None)
+            if datetime.utcnow() - last_bar < timedelta(hours=1):
+                continue  # only trade on closed candles
+            sig = signal_for_bar(df, j - 1)
+            if sig is None:
+                continue
+            px = float(df.iloc[j - 1]["close"])
+            a = float(df.iloc[j - 1]["atr"])
+            stop_dist = cfg["atr_mult_stop"] * a
+            tgt_dist = cfg["atr_mult_target"] * a
+            if tgt_dist / stop_dist < MIN_TARGET_RR:
+                continue
+            lev = min(tgt_dist / a, cfg["max_lev"], HARD_LEV_CAP)
+            qty = self.pf.equity * cfg["risk_pct"] / stop_dist
+            notional = qty * px
+            if notional > self.pf.equity * lev:
+                notional = self.pf.equity * lev
+                qty = notional / px
+            qty = float(self.x.amount_to_precision(sym, qty))
+            side = "buy" if sig == "long" else "sell"
+            stop = px - stop_dist if sig == "long" else px + stop_dist
+            tgt = px + tgt_dist if sig == "long" else px - tgt_dist
+            await self.ex.set_leverage(sym, lev)
+            order = await self.ex.market_entry(sym, side, qty, px)
+            if order is None:
+                continue
+            await self.ex.protective_orders(sym, side, qty, stop, tgt)
+            self.pf.open_positions[sym] = Position(sym, sig, float(order.get("average", px)),
+                                                   qty, lev, stop, tgt, str(df.index[-1]))
+
+    async def fetch_recent(self, symbol: str, bars: int = 300) -> Optional[pd.DataFrame]:
+        try:
+            rows = await self.x.fetch_ohlcv(symbol, "1h", limit=bars)
+            df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+            df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+            df = df.set_index("time").drop(columns="ts")
+            return add_indicators(df)
+        except Exception as e:
+            log.error(f"ohlcv fetch failed {symbol}: {e}")
+            return None
+
+    async def heartbeat(self):
+        with open(HEARTBEAT_FILE, "w") as f:
+            f.write(datetime.now(timezone.utc).isoformat())
+
+    async def run(self):
+        log.info(f"starting in {('DRY' if self.dry else 'LIVE')} mode")
+        while True:
+            try:
+                self.pf.equity = await self.get_equity()
+                self.pf.roll_day(datetime.now(timezone.utc))
+                self.pf.daily_check()
+                live = await self.sync_positions()
+                await self.evaluate_entries(live)
+                await self.heartbeat()
+            except ccxt.AuthenticationError:
+                log.critical("auth failed - check API keys")
+                sys.exit(1)
+            except Exception as e:
+                log.error(f"loop error (continuing): {type(e).__name__}: {e}")
+            await asyncio.sleep(POLL_SECONDS)
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--backtest", action="store_true")
+    p.add_argument("--dry", action="store_true")
+    p.add_argument("--testnet", action="store_true")
+    p.add_argument("--live", action="store_true")
+    p.add_argument("--days", type=int, default=180, help="backtest lookback days")
+    args = p.parse_args()
+
+    if args.backtest:
+        asyncio.run(run_backtest(args.days))
+    elif args.dry:
+        asyncio.run(LiveBot("dry").run())
+    elif args.testnet:
+        asyncio.run(LiveBot("testnet").run())
+    elif args.live:
+        if input("REAL MONEY. Type LIVE to confirm: ") != "LIVE":
+            sys.exit(0)
+        asyncio.run(LiveBot("live").run())
+    else:
+        print("usage: python perps_bot.py --backtest | --dry | --testnet | --live")
